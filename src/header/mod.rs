@@ -183,6 +183,12 @@ pub struct Headers {
     data: HashMap<HeaderName, Item>
 }
 
+impl Default for Headers {
+    fn default() -> Headers {
+        Headers::new()
+    }
+}
+
 impl Headers {
 
     /// Creates a new, empty headers map.

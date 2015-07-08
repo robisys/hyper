@@ -3,8 +3,7 @@
 //! # Server
 //!
 //! A `Server` is created to listen on port, parse HTTP requests, and hand
-//! them off to a `Handler`. By default, the Server will listen across multiple
-//! threads, but that can be configured to a single thread if preferred.
+//! them off to a `Handler`.
 //!
 //! # Handling requests
 //!
@@ -48,19 +47,6 @@
 //! }).unwrap();
 //! ```
 //!
-//! Since the `Server` will be listening on multiple threads, the `Handler`
-//! must implement `Sync`: any mutable state must be synchronized.
-//!
-//! ```no_run
-//! use std::sync::atomic::{AtomicUsize, Ordering};
-//! use hyper::server::{Server, Request, Response};
-//!
-//! let counter = AtomicUsize::new(0);
-//! Server::http("0.0.0.0:0").unwrap().handle(move |req: Request, res: Response| {
-//!     counter.fetch_add(1, Ordering::Relaxed);
-//! }).unwrap();
-//! ```
-//!
 //! # The `Request` and `Response` pair
 //!
 //! A `Handler` receives a pair of arguments, a `Request` and a `Response`. The
@@ -85,83 +71,47 @@
 //!     }
 //! }).unwrap();
 //! ```
-//!
-//! ## An aside: Write Status
-//!
-//! The `Response` uses a phantom type parameter to determine its write status.
-//! What does that mean? In short, it ensures you never write a body before
-//! adding all headers, and never add a header after writing some of the body.
-//!
-//! This is often done in most implementations by include a boolean property
-//! on the response, such as `headers_written`, checking that each time the
-//! body has something to write, so as to make sure the headers are sent once,
-//! and only once. But this has 2 downsides:
-//!
-//! 1. You are typically never notified that your late header is doing nothing.
-//! 2. There's a runtime cost to checking on every write.
-//!
-//! Instead, hyper handles this statically, or at compile-time. A
-//! `Response<Fresh>` includes a `headers_mut()` method, allowing you add more
-//! headers. It also does not implement `Write`, so you can't accidentally
-//! write early. Once the "head" of the response is correct, you can "send" it
-//! out by calling `start` on the `Response<Fresh>`. This will return a new
-//! `Response<Streaming>` object, that no longer has `headers_mut()`, but does
-//! implement `Write`.
+use std::error::Error as StdError;
 use std::fmt;
-use std::io::{self, ErrorKind, BufWriter, Write};
-use std::net::{SocketAddr, ToSocketAddrs};
-use std::thread::{self, JoinHandle};
+use std::marker::PhantomData;
+use std::net::{SocketAddr/*, ToSocketAddrs*/};
+use std::sync::mpsc;
+use std::thread;
+
 use std::time::Duration;
 
-use num_cpus;
+//use num_cpus;
+
+use mio::{TryAccept, Evented, EventSet, PollOpt};
+use rotor::{self, Scope};
 
 pub use self::request::Request;
 pub use self::response::Response;
 
-pub use net::{Fresh, Streaming};
+use http::{self, Next};
+//use net::{HttpsListener, Ssl, HttpsStream};
+use net::{HttpListener, HttpStream, Transport};
 
-use Error;
-use buffer::BufReader;
-use header::{Headers, Expect, Connection};
-use http;
-use method::Method;
-use net::{NetworkListener, NetworkStream, HttpListener, HttpsListener, Ssl};
-use status::StatusCode;
-use uri::RequestUri;
-use version::HttpVersion::Http11;
 
-use self::listener::ListenerPool;
-
-pub mod request;
-pub mod response;
-
-mod listener;
+mod request;
+mod response;
+mod message;
 
 /// A server can listen on a TCP socket.
 ///
 /// Once listening, it will create a `Request`/`Response` pair for each
 /// incoming connection, and hand them to the provided handler.
 #[derive(Debug)]
-pub struct Server<L = HttpListener> {
-    listener: L,
+pub struct Server<T: TryAccept + Evented> {
+    listener: T,
     timeouts: Timeouts,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Default)]
 struct Timeouts {
     read: Option<Duration>,
     write: Option<Duration>,
     keep_alive: Option<Duration>,
-}
-
-impl Default for Timeouts {
-    fn default() -> Timeouts {
-        Timeouts {
-            read: None,
-            write: None,
-            keep_alive: Some(Duration::from_secs(5))
-        }
-    }
 }
 
 macro_rules! try_option(
@@ -173,10 +123,10 @@ macro_rules! try_option(
     }}
 );
 
-impl<L: NetworkListener> Server<L> {
+impl<T> Server<T> where T: TryAccept + Evented, <T as TryAccept>::Output: Transport {
     /// Creates a new server with the provided handler.
     #[inline]
-    pub fn new(listener: L) -> Server<L> {
+    pub fn new(listener: T) -> Server<T> {
         Server {
             listener: listener,
             timeouts: Timeouts::default()
@@ -208,247 +158,213 @@ impl<L: NetworkListener> Server<L> {
 }
 
 impl Server<HttpListener> {
-    /// Creates a new server that will handle `HttpStream`s.
-    pub fn http<To: ToSocketAddrs>(addr: To) -> ::Result<Server<HttpListener>> {
-        HttpListener::new(addr).map(Server::new)
+    pub fn http(addr: &str) -> ::Result<Server<HttpListener>> {
+        use ::mio::tcp::TcpListener;
+        TcpListener::bind(&addr.parse().unwrap())
+            .map(HttpListener)
+            .map(Server::new)
+            .map_err(From::from)
     }
 }
 
-impl<S: Ssl + Clone + Send> Server<HttpsListener<S>> {
+
+/*
+impl<S: Ssl> Server<HttpsStream<S::Stream>> {
     /// Creates a new server that will handle `HttpStream`s over SSL.
     ///
     /// You can use any SSL implementation, as long as implements `hyper::net::Ssl`.
-    pub fn https<A: ToSocketAddrs>(addr: A, ssl: S) -> ::Result<Server<HttpsListener<S>>> {
+    pub fn https(addr: &SocketAddr, ssl: S) -> ::Result<Server<HttpsListener<S>>> {
         HttpsListener::new(addr, ssl).map(Server::new)
     }
 }
+*/
 
-impl<L: NetworkListener + Send + 'static> Server<L> {
+
+//impl<T: Transport> Server<T> {
+impl Server<HttpListener> {
     /// Binds to a socket and starts handling connections.
-    pub fn handle<H: Handler + 'static>(self, handler: H) -> ::Result<Listening> {
-        self.handle_threads(handler, num_cpus::get() * 5 / 4)
-    }
+    pub fn handle<H>(self, mut factory: H) -> ::Result<Listening>
+    where H: HandlerFactory<HttpStream> {
+        let addr = try!(self.listener.0.local_addr());
+        let (notifier_tx, notifier_rx) = mpsc::channel();
+        let (shutdown_tx, shutdown_rx) = mpsc::channel();
+        let listener = self.listener;
+        let handle = try!(thread::Builder::new().name("hyper-server".to_owned()).spawn(move || {
+            let mut loop_ = rotor::Loop::new(&rotor::Config::new()).unwrap();
+            loop_.add_machine_with(move |scope| {
+                try!(notifier_tx.send(scope.notifier()));
+                try!(scope.register(&listener, EventSet::readable(), PollOpt::level()));
+                Ok(ServerFsm::Listener::<HttpListener, _, H>(listener, shutdown_rx, PhantomData))
+            }).unwrap();
+            loop_.run(move || {
+                message::Message::new(factory.create())
+            }).unwrap();
+        }));
 
-    /// Binds to a socket and starts handling connections with the provided
-    /// number of threads.
-    pub fn handle_threads<H: Handler + 'static>(self, handler: H,
-            threads: usize) -> ::Result<Listening> {
-        handle(self, handler, threads)
+        let notifier = notifier_rx.recv().unwrap();
+
+        Ok(Listening {
+            addr: addr,
+            shutdown: (shutdown_tx, notifier),
+            handle: Some(handle),
+        })
     }
 }
 
-fn handle<H, L>(mut server: Server<L>, handler: H, threads: usize) -> ::Result<Listening>
-where H: Handler + 'static, L: NetworkListener + Send + 'static {
-    let socket = try!(server.listener.local_addr());
-
-    debug!("threads = {:?}", threads);
-    let pool = ListenerPool::new(server.listener);
-    let worker = Worker::new(handler, server.timeouts);
-    let work = move |mut stream| worker.handle_connection(&mut stream);
-
-    let guard = thread::spawn(move || pool.accept(work, threads));
-
-    Ok(Listening {
-        _guard: Some(guard),
-        socket: socket,
-    })
+enum ServerFsm<A, F, H>
+where A: TryAccept + rotor::Evented,
+      A::Output: Transport,
+      F: http::MessageHandlerFactory<A::Output, Output=message::Message<H::Output, A::Output>>,
+      H: HandlerFactory<A::Output> {
+    Listener(A, mpsc::Receiver<Shutdown>, PhantomData<F>),
+    Conn(http::Conn<A::Output, message::Message<H::Output, A::Output>>)
 }
 
-struct Worker<H: Handler + 'static> {
-    handler: H,
-    timeouts: Timeouts,
-}
+impl<A, F, H> rotor::Machine for ServerFsm<A, F, H>
+where A: TryAccept + rotor::Evented,
+      A::Output: Transport,
+      F: http::MessageHandlerFactory<A::Output, Output=message::Message<H::Output, A::Output>>,
+      H: HandlerFactory<A::Output> {
+    type Context = F;
+    type Seed = A::Output;
 
-impl<H: Handler + 'static> Worker<H> {
-    fn new(handler: H, timeouts: Timeouts) -> Worker<H> {
-        Worker {
-            handler: handler,
-            timeouts: timeouts,
-        }
+    fn create(seed: Self::Seed, scope: &mut Scope<F>) -> Result<Self, Box<StdError>> {
+        try!(scope.register(&seed, EventSet::readable(), PollOpt::level()));
+        Ok(ServerFsm::Conn(http::Conn::new(seed)))
     }
 
-    fn handle_connection<S>(&self, mut stream: &mut S) where S: NetworkStream + Clone {
-        debug!("Incoming stream");
+    fn ready(self, events: EventSet, scope: &mut Scope<F>) -> rotor::Response<Self, Self::Seed> {
+        match self {
+            ServerFsm::Listener(listener, rx, m) => {
+                match listener.accept() {
+                    Ok(Some(conn)) => {
+                        rotor::Response::spawn(ServerFsm::Listener(listener, rx, m), conn)
+                    },
+                    Ok(None) => rotor::Response::ok(ServerFsm::Listener(listener, rx, m)),
+                    Err(e) => {
+                        error!("listener accept error {}", e);
+                        // usually fine, just keep listening
+                        rotor::Response::ok(ServerFsm::Listener(listener, rx, m))
+                    }
+                }
+            },
+            ServerFsm::Conn(conn) => {
+                if events.is_error() {
+                    error!("Conn error event");
+                }
 
-        self.handler.on_connection_start();
-
-        if let Err(e) = self.set_timeouts(&*stream) {
-            error!("set_timeouts error: {:?}", e);
-            return;
-        }
-
-        let addr = match stream.peer_addr() {
-            Ok(addr) => addr,
-            Err(e) => {
-                error!("Peer Name error: {:?}", e);
-                return;
-            }
-        };
-
-        // FIXME: Use Type ascription
-        let stream_clone: &mut NetworkStream = &mut stream.clone();
-        let mut rdr = BufReader::new(stream_clone);
-        let mut wrt = BufWriter::new(stream);
-
-        while self.keep_alive_loop(&mut rdr, &mut wrt, addr) {
-            if let Err(e) = self.set_read_timeout(*rdr.get_ref(), self.timeouts.keep_alive) {
-                error!("set_read_timeout keep_alive {:?}", e);
-                break;
-            }
-        }
-
-        self.handler.on_connection_end();
-
-        debug!("keep_alive loop ending for {}", addr);
-    }
-
-    fn set_timeouts(&self, s: &NetworkStream) -> io::Result<()> {
-        try!(self.set_read_timeout(s, self.timeouts.read));
-        self.set_write_timeout(s, self.timeouts.write)
-    }
-
-    fn set_write_timeout(&self, s: &NetworkStream, timeout: Option<Duration>) -> io::Result<()> {
-        s.set_write_timeout(timeout)
-    }
-
-    fn set_read_timeout(&self, s: &NetworkStream, timeout: Option<Duration>) -> io::Result<()> {
-        s.set_read_timeout(timeout)
-    }
-
-    fn keep_alive_loop<W: Write>(&self, mut rdr: &mut BufReader<&mut NetworkStream>,
-            wrt: &mut W, addr: SocketAddr) -> bool {
-        let req = match Request::new(rdr, addr) {
-            Ok(req) => req,
-            Err(Error::Io(ref e)) if e.kind() == ErrorKind::ConnectionAborted => {
-                trace!("tcp closed, cancelling keep-alive loop");
-                return false;
-            }
-            Err(Error::Io(e)) => {
-                debug!("ioerror in keepalive loop = {:?}", e);
-                return false;
-            }
-            Err(e) => {
-                //TODO: send a 400 response
-                error!("request error = {:?}", e);
-                return false;
-            }
-        };
-
-        if !self.handle_expect(&req, wrt) {
-            return false;
-        }
-
-        if let Err(e) = req.set_read_timeout(self.timeouts.read) {
-            error!("set_read_timeout {:?}", e);
-            return false;
-        }
-
-        let mut keep_alive = self.timeouts.keep_alive.is_some() &&
-            http::should_keep_alive(req.version, &req.headers);
-        let version = req.version;
-        let mut res_headers = Headers::new();
-        if !keep_alive {
-            res_headers.set(Connection::close());
-        }
-        {
-            let mut res = Response::new(wrt, &mut res_headers);
-            res.version = version;
-            self.handler.handle(req, res);
-        }
-
-        // if the request was keep-alive, we need to check that the server agrees
-        // if it wasn't, then the server cannot force it to be true anyways
-        if keep_alive {
-            keep_alive = http::should_keep_alive(version, &res_headers);
-        }
-
-        debug!("keep_alive = {:?} for {}", keep_alive, addr);
-        keep_alive
-    }
-
-    fn handle_expect<W: Write>(&self, req: &Request, wrt: &mut W) -> bool {
-         if req.version == Http11 && req.headers.get() == Some(&Expect::Continue) {
-            let status = self.handler.check_continue((&req.method, &req.uri, &req.headers));
-            match write!(wrt, "{} {}\r\n\r\n", Http11, status).and_then(|_| wrt.flush()) {
-                Ok(..) => (),
-                Err(e) => {
-                    error!("error writing 100-continue: {:?}", e);
-                    return false;
+                match conn.ready(events, scope) {
+                    Some(conn) => rotor::Response::ok(ServerFsm::Conn(conn)),
+                    None => rotor::Response::done()
                 }
             }
+        }
+    }
 
-            if status != StatusCode::Continue {
-                debug!("non-100 status ({}) for Expect 100 request", status);
-                return false;
-            }
+    fn spawned(self, _scope: &mut Scope<F>) -> rotor::Response<Self, Self::Seed> {
+        match self {
+            ServerFsm::Listener(listener, rx, m) => {
+                match listener.accept() {
+                    Ok(Some(conn)) => {
+                        rotor::Response::spawn(ServerFsm::Listener(listener, rx, m), conn)
+                    },
+                    Ok(None) => rotor::Response::ok(ServerFsm::Listener(listener, rx, m)),
+                    Err(e) => {
+                        error!("listener accept error {}", e);
+                        // usually fine, just keep listening
+                        rotor::Response::ok(ServerFsm::Listener(listener, rx, m))
+                    }
+                }
+            },
+            sock => rotor::Response::ok(sock)
         }
 
-        true
+    }
+
+    fn timeout(self, _scope: &mut Scope<F>) -> rotor::Response<Self, Self::Seed> {
+        unimplemented!("timeout")
+    }
+
+    fn wakeup(self, scope: &mut Scope<F>) -> rotor::Response<Self, Self::Seed> {
+        match self {
+            ServerFsm::Listener(lst, shutdown, m) => {
+                if shutdown.try_recv().is_ok() {
+                    let _ = scope.deregister(&lst);
+                    scope.shutdown_loop();
+                    rotor::Response::done()
+                } else {
+                    rotor::Response::ok(ServerFsm::Listener(lst, shutdown, m))
+                }
+            },
+            conn => rotor::Response::ok(conn)
+        }
     }
 }
 
-/// A listening server, which can later be closed.
+#[derive(Debug)]
+struct Shutdown;
+
+/// A handle of the running server.
 pub struct Listening {
-    _guard: Option<JoinHandle<()>>,
-    /// The socket addresses that the server is bound to.
-    pub socket: SocketAddr,
+    /// The address this server is listening on.
+    pub addr: SocketAddr,
+    shutdown: (mpsc::Sender<Shutdown>, rotor::Notifier),
+    handle: Option<::std::thread::JoinHandle<()>>,
 }
 
 impl fmt::Debug for Listening {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "Listening {{ socket: {:?} }}", self.socket)
+        f.debug_struct("Listening")
+            .field("addr", &self.addr)
+            .finish()
     }
 }
 
 impl Drop for Listening {
     fn drop(&mut self) {
-        let _ = self._guard.take().map(|g| g.join());
+        self.handle.take().map(|handle| {
+            handle.join().unwrap();
+        });
     }
 }
 
 impl Listening {
+    /// Starts the Server, blocking until it is shutdown.
+    pub fn forever(self) {
+
+    }
     /// Stop the server from listening to its socket address.
-    pub fn close(&mut self) -> ::Result<()> {
-        let _ = self._guard.take();
+    pub fn close(self) {
         debug!("closing server");
-        Ok(())
+        self.shutdown.0.send(Shutdown).unwrap();
+        self.shutdown.1.wakeup().unwrap();
     }
 }
 
-/// A handler that can handle incoming requests for a server.
-pub trait Handler: Sync + Send {
-    /// Receives a `Request`/`Response` pair, and should perform some action on them.
-    ///
-    /// This could reading from the request, and writing to the response.
-    fn handle<'a, 'k>(&'a self, Request<'a, 'k>, Response<'a, Fresh>);
-
-    /// Called when a Request includes a `Expect: 100-continue` header.
-    ///
-    /// By default, this will always immediately response with a `StatusCode::Continue`,
-    /// but can be overridden with custom behavior.
-    fn check_continue(&self, _: (&Method, &RequestUri, &Headers)) -> StatusCode {
-        StatusCode::Continue
-    }
-
-    /// This is run after a connection is received, on a per-connection basis (not a
-    /// per-request basis, as a connection with keep-alive may handle multiple
-    /// requests)
-    fn on_connection_start(&self) { }
-
-    /// This is run before a connection is closed, on a per-connection basis (not a
-    /// per-request basis, as a connection with keep-alive may handle multiple
-    /// requests)
-    fn on_connection_end(&self) { }
+pub trait Handler<T: Transport>: Send + 'static {
+    fn on_request(&mut self, request: Request) -> Next;
+    fn on_request_readable(&mut self, request: &mut http::Decoder<T>) -> Next;
+    fn on_response(&mut self, response: &mut Response) -> Next;
+    fn on_response_writable(&mut self, response: &mut http::Encoder<T>) -> Next;
 }
 
-impl<F> Handler for F where F: Fn(Request, Response<Fresh>), F: Sync + Send {
-    fn handle<'a, 'k>(&'a self, req: Request<'a, 'k>, res: Response<'a, Fresh>) {
-        self(req, res)
+
+pub trait HandlerFactory<T: Transport>: Send + 'static {
+    type Output: Handler<T>;
+    fn create(&mut self) -> Self::Output;
+}
+
+impl<F, H, T> HandlerFactory<T> for F
+where F: FnMut() -> H + Send + 'static, H: Handler<T>, T: Transport {
+    type Output = H;
+    fn create(&mut self) -> H {
+        self()
     }
 }
 
 #[cfg(test)]
 mod tests {
+    /*
     use header::Headers;
     use method::Method;
     use mock::MockStream;
@@ -483,7 +399,7 @@ mod tests {
     fn test_check_continue_reject() {
         struct Reject;
         impl Handler for Reject {
-            fn handle<'a, 'k>(&'a self, _: Request<'a, 'k>, res: Response<'a, Fresh>) {
+            fn handle(&self, _: Request, res: Response<Fresh>) {
                 res.start().unwrap().end().unwrap();
             }
 
@@ -504,4 +420,5 @@ mod tests {
         Worker::new(Reject, Default::default()).handle_connection(&mut mock);
         assert_eq!(mock.write, &b"HTTP/1.1 417 Expectation Failed\r\n\r\n"[..]);
     }
+    */
 }
