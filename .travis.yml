@@ -1,0 +1,29 @@
+language: rust
+matrix:
+    fast_finish: true
+    include:
+        - rust: stable
+        
+  sudo: false
+
+cache:
+    apt: true
+    directories:
+        - target/debug/deps
+        - target/debug/build
+
+script:
+  - cargo build --verbose $FEATURES
+  - cargo test --verbose $FEATURES
+ 
+
+addons:
+  apt:
+    packages:
+      - libcurl4-openssl-dev
+      - libelf-dev
+      - libdw-dev
+
+
+after_success: |
+    echo " success "
