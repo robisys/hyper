@@ -4,7 +4,7 @@ matrix:
     include:
         - rust: stable
         
-  sudo: false
+sudo: false
 
 cache:
     apt: true
@@ -13,8 +13,8 @@ cache:
         - target/debug/build
 
 script:
-  - cargo build --verbose $FEATURES
-  - cargo test --verbose $FEATURES
+  - cargo build --verbose 
+  - cargo test --verbose 
  
 
 addons:
